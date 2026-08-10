@@ -1,29 +1,36 @@
 package seanced.clock;
-
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.ArrayList;
+import java.util.List;
 
 public final class SystemClock implements Clock {
-    private final ScheduledExecutorService scheduler =
-            Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "seanced-clock");
-                t.setDaemon(true);
-                return t;
-    });
+    private long currentTime = 0;
+    private final List<Pending> pendingList = new ArrayList<>();
 
     @Override
     public long nowMillis() {
-        return System.currentTimeMillis();
+        return currentTime;
     }
 
     @Override
     public void scheduleOnce(long delayMillis, Runnable task) {
-        scheduler.schedule(task, delayMillis, TimeUnit.MILLISECONDS);
+        long dueTime = currentTime + delayMillis;
+        pendingList.add(new Pending(dueTime, task));
     }
 
-    /** Stops the background scheduler. Call on node shutdown. */
-    public void close() {
-        scheduler.shutdownNow();
+    private record Pending(long dueTime, Runnable task) {}
+
+    public void advanceTo(long newTime) {
+        currentTime = newTime;
+        List<Pending> tasksToBeRun = new ArrayList<>();
+
+        for (Pending taskToBeRun: pendingList) {
+            if (taskToBeRun.dueTime() <= currentTime) tasksToBeRun.add(taskToBeRun);
+        }
+
+        pendingList.removeAll(tasksToBeRun);
+
+        for (Pending taskToBeRun : tasksToBeRun) {
+            taskToBeRun.task().run();
+        }
     }
 }

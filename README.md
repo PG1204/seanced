@@ -110,6 +110,28 @@ seconds. The knobs that matter:
   cluster size and with packet loss.
 - **`indirectProbeCount`** (*k*) — independent paths checked before suspecting.
   Never set it to zero; that is what a false positive is made of.
+- **`deadProbeInterval`** — how often to re-check a dead member instead of a
+  live peer. See below; don't set it to zero without understanding why.
+
+## Recovering from belief splits
+
+Dead members are out of the probe rotation, which is efficient but creates a
+trap: two nodes that buried each other during a partition will never exchange
+another message once it heals, because each has removed the other. A node
+isolated past the suspicion timeout buries the *entire* cluster and is
+stranded permanently.
+
+Two mechanisms close that loop:
+
+- Every `deadProbeInterval` periods a node probes a buried member instead of a
+  live one, attaching its death claim so the target can refute it.
+- Hearing from a node it believes dead, a node hands back that claim rather
+  than ignoring the message — a node cannot answer a charge it has never heard.
+
+Together these make burial recoverable. It also fixes node restarts: a process
+that comes back on its old address starts at incarnation zero, loses to the
+cluster's `DEAD` entry, and would otherwise believe it had rejoined while every
+peer still considered it gone — on every node of a rolling deploy.
 
 ## Testing
 
@@ -117,10 +139,19 @@ seconds. The knobs that matter:
 ./gradlew test
 ```
 
-71 tests. The cluster tests in `SwimClusterTest` run whole clusters against a
-simulated clock and network, covering convergence, crash detection, indirect
-probe rescue, refutation, partitions and healing, 30% packet loss, graceful
+78 tests. `SwimClusterTest` runs whole clusters against a simulated clock and
+network, covering convergence, crash detection, indirect probe rescue,
+refutation, partitions and healing, restart rejoin, 30% packet loss, graceful
 leave, and the constant per-node message load that is SWIM's headline property.
+
+`SwimSimulationTest` is randomized simulation testing: 1000 runs, each building
+a cluster of random size, subjecting it to a random schedule of crashes, flaps,
+partitions, link failures and packet loss, then healing everything and
+asserting the cluster reconverges. Because the clock, the network and every
+node's peer selection are all seeded, a failure reproduces exactly rather than
+appearing once in a hundred CI runs — `reproduceSingleSeed` replays one.
+Raising the count to 5000 takes about 25 seconds and makes a good pre-release
+sweep.
 
 ## Status and limitations
 

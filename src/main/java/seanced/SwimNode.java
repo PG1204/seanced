@@ -68,6 +68,7 @@ public final class SwimNode implements AutoCloseable {
 
     private long incarnation;
     private long nextSeqNo;
+    private long periodCount;
     private boolean running;
 
     public SwimNode(NodeId self, SwimConfig config, Clock clock, Transport transport) {
@@ -168,7 +169,7 @@ public final class SwimNode implements AutoCloseable {
             return;
         }
         try {
-            members.nextProbeTarget(random).ifPresent(this::probe);
+            selectProbeTarget().ifPresent(this::probe);
         } catch (RuntimeException e) {
             LOG.log(System.Logger.Level.ERROR, "protocol period failed on " + self, e);
         } finally {
@@ -177,7 +178,35 @@ public final class SwimNode implements AutoCloseable {
         }
     }
 
+    /**
+     * Chooses this period's probe target, occasionally re-checking the graveyard.
+     *
+     * <p>Dead members are normally never contacted again, which is efficient but leaves
+     * belief splits permanent: two nodes that buried each other during a partition will
+     * not exchange another message once the network recovers, because each has removed
+     * the other from its rotation. A node isolated past the suspicion timeout buries the
+     * entire cluster and is stranded for good.
+     *
+     * <p>Spending one period in {@code deadProbeInterval} on a dead member closes that
+     * loop. The probe costs almost nothing when the node really is gone, and when it is
+     * not, the exchange lets both sides refute and rejoin.
+     */
+    private Optional<NodeId> selectProbeTarget() {
+        periodCount++;
+        if (config.deadProbeInterval() > 0 && periodCount % config.deadProbeInterval() == 0) {
+            Optional<NodeId> buried = members.randomDeadMember(random);
+            if (buried.isPresent()) {
+                return buried;
+            }
+        }
+        return members.nextProbeTarget(random);
+    }
+
     private void probe(NodeId target) {
+        // If this is a graveyard re-check, attach our death claim so the target can
+        // refute it. It cannot answer a charge it has never heard.
+        challengeIfBelievedDead(target);
+
         long seqNo = nextSeqNo++;
         pendingProbes.put(seqNo, Probe.direct(target));
         send(target, gossipList -> new Ping(self, seqNo, gossipList));
@@ -265,6 +294,7 @@ public final class SwimNode implements AutoCloseable {
         }
         try {
             learn(message.from());
+            challengeIfBelievedDead(message.from());
             applyGossip(message.gossip());
 
             switch (message) {
@@ -363,6 +393,26 @@ public final class SwimNode implements AutoCloseable {
         gossip.add(MembershipUpdate.alive(self, incarnation));
         LOG.log(System.Logger.Level.DEBUG, "{0} refuting {1} at incarnation {2}",
                 self, claim.state(), incarnation);
+    }
+
+    /**
+     * Tells a peer we believe is dead that we believe it, so it can refute.
+     *
+     * <p>Hearing from a node we have buried means one of us is wrong, and only that node
+     * can settle it. Handing it our claim gives it the chance: it raises its incarnation
+     * past ours and gossips ALIVE, which outranks the death everywhere.
+     *
+     * <p>Without this a node that restarts on its old address is locked out. It comes
+     * back at incarnation zero, which loses to our DEAD entry, and it never hears the
+     * claim it would need to refute — the original rumour has long expired, dead members
+     * are deliberately left out of anti-entropy, and we no longer probe it. It would
+     * believe it had rejoined while every peer still considered it gone, until the
+     * reaper eventually forgot it. Rolling restarts would hit that on every node.
+     */
+    private void challengeIfBelievedDead(NodeId peer) {
+        members.get(peer)
+                .filter(Member::isDead)
+                .ifPresent(member -> gossip.add(member.asUpdate()));
     }
 
     /** Records a node we have just heard from, in case gossip has not reached us yet. */

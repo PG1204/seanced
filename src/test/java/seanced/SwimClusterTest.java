@@ -39,12 +39,14 @@ class SwimClusterTest {
         final FakeClock clock = new FakeClock();
         final InMemoryNetwork network = new InMemoryNetwork(clock);
         final List<SwimNode> nodes = new ArrayList<>();
+        final SwimConfig config;
 
         Cluster(int size) {
             this(size, CONFIG);
         }
 
         Cluster(int size, SwimConfig config) {
+            this.config = config;
             for (int i = 0; i < size; i++) {
                 NodeId id = new NodeId("10.0.0." + (i + 1), 7946);
                 Transport transport = network.join(id);
@@ -64,6 +66,21 @@ class SwimClusterTest {
 
         SwimNode node(int index) {
             return nodes.get(index);
+        }
+
+        /**
+         * Replaces a node with a fresh one on the same address, as a process restart would.
+         * The new node starts at incarnation zero with no memory of the cluster.
+         */
+        void restart(int index) {
+            NodeId id = id(index);
+            nodes.get(index).close();
+            network.recover(id);
+            SwimNode replacement = new SwimNode(
+                    id, config, clock, network.join(id), new Random(5000 + index));
+            nodes.set(index, replacement);
+            replacement.join(nodes.get(0).id());
+            replacement.start();
         }
 
         NodeId id(int index) {
@@ -196,6 +213,54 @@ class SwimClusterTest {
         }
     }
 
+    @Test
+    void aRestartedNodeRejoinsTheCluster() {
+        // A node that restarts on the same address comes back at incarnation zero, which
+        // loses to the cluster's DEAD entry for it. It can only get back in by refuting,
+        // and it can only refute a claim it has actually heard — so the cluster has to
+        // tell it. Without that, the restarted node believes it has rejoined while every
+        // peer still considers it gone: a split brain that lasts until the reaper runs.
+        // Rolling deploys hit this on every node.
+        try (Cluster cluster = new Cluster(3)) {
+            cluster.startAll();
+            cluster.run(20_000);
+
+            cluster.network.crash(cluster.id(2));
+            cluster.run(60_000);
+            assertEquals(Optional.of(MemberState.DEAD), cluster.stateOf(0, 2), "precondition: buried");
+
+            cluster.restart(2);
+            cluster.run(60_000);
+
+            assertEquals(Optional.of(MemberState.ALIVE), cluster.stateOf(0, 2),
+                    "the cluster should accept the restarted node back");
+            assertEquals(Optional.of(MemberState.ALIVE), cluster.stateOf(1, 2),
+                    "and the acceptance should spread by gossip");
+            assertTrue(cluster.node(2).incarnation() > 0,
+                    "rejoining requires refuting the death at a higher incarnation");
+        }
+    }
+
+    @Test
+    void aRestartedNodeDoesNotSplitBrain() {
+        // The restarted node's own view must agree with the cluster's view of it.
+        try (Cluster cluster = new Cluster(3)) {
+            cluster.startAll();
+            cluster.run(20_000);
+
+            cluster.network.crash(cluster.id(2));
+            cluster.run(60_000);
+            cluster.restart(2);
+            cluster.run(60_000);
+
+            boolean clusterAcceptsIt = cluster.stateOf(0, 2).equals(Optional.of(MemberState.ALIVE));
+            boolean itThinksItBelongs = cluster.node(2).membership().aliveCount() == 3;
+
+            assertEquals(itThinksItBelongs, clusterAcceptsIt,
+                    "a node must not believe it has rejoined while the cluster still buries it");
+        }
+    }
+
     // ------------------------------------------------------------ indirect probing
 
     @Test
@@ -319,6 +384,54 @@ class SwimClusterTest {
                             "node " + observer + " should see node " + subject + " recovered");
                 }
             }
+        }
+    }
+
+    @Test
+    void mutuallyBuriedNodesReconcileWhenTheNetworkReturns() {
+        // Once two nodes have buried each other, neither will probe the other — dead
+        // members are out of the rotation — so without a deliberate retry the split is
+        // permanent, long after the network is fine. A node isolated past the suspicion
+        // timeout would bury the entire cluster and be stranded forever.
+        try (Cluster cluster = new Cluster(4)) {
+            cluster.startAll();
+            cluster.run(20_000);
+
+            cluster.network.partition(Set.of(cluster.id(0)));
+            cluster.run(60_000);
+            assertEquals(Optional.of(MemberState.DEAD), cluster.stateOf(0, 1),
+                    "precondition: the isolated node buried its peers");
+            assertEquals(Optional.of(MemberState.DEAD), cluster.stateOf(1, 0),
+                    "precondition: and they buried it");
+
+            cluster.network.healPartition();
+            cluster.run(200_000);
+
+            for (int observer = 0; observer < 4; observer++) {
+                for (int subject = 0; subject < 4; subject++) {
+                    assertEquals(Optional.of(MemberState.ALIVE), cluster.stateOf(observer, subject),
+                            "node " + observer + " should have reconciled with node " + subject);
+                }
+            }
+        }
+    }
+
+    @Test
+    void anIsolatedNodeRecoversAfterBuryingTheWholeCluster() {
+        try (Cluster cluster = new Cluster(5)) {
+            cluster.startAll();
+            cluster.run(20_000);
+
+            cluster.network.partition(Set.of(cluster.id(4)));
+            cluster.run(80_000);
+            assertEquals(1, cluster.node(4).membership().aliveCount(),
+                    "precondition: the isolated node is alone in its own view");
+
+            cluster.network.healPartition();
+            cluster.run(200_000);
+
+            assertEquals(5, cluster.node(4).membership().aliveCount(),
+                    "it should find the cluster again rather than stay stranded");
         }
     }
 

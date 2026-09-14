@@ -25,6 +25,11 @@ package seanced;
  * @param deadReapMillis        how long a dead member is remembered before being forgotten.
  *                              Must far exceed rumour lifetime, or a straggling ALIVE rumour
  *                              could resurrect a node the cluster has already buried.
+ * @param deadProbeInterval     probe a dead member instead of a live peer every this many
+ *                              periods. Dead nodes are otherwise never contacted again, so
+ *                              two nodes that buried each other during a partition would
+ *                              stay split long after the network recovered. Set to zero to
+ *                              disable, accepting that belief splits become permanent.
  */
 public record SwimConfig(
         long protocolPeriodMillis,
@@ -33,7 +38,8 @@ public record SwimConfig(
         long suspicionTimeoutMillis,
         int maxGossipPerMessage,
         int gossipMultiplier,
-        long deadReapMillis) {
+        long deadReapMillis,
+        int deadProbeInterval) {
 
     public SwimConfig {
         if (protocolPeriodMillis <= 0) {
@@ -58,11 +64,14 @@ public record SwimConfig(
         if (deadReapMillis <= 0) {
             throw new IllegalArgumentException("deadReapMillis must be positive");
         }
+        if (deadProbeInterval < 0) {
+            throw new IllegalArgumentException("deadProbeInterval must not be negative");
+        }
     }
 
     /** LAN defaults: detects a crash in roughly 6 seconds. */
     public static SwimConfig defaults() {
-        return new SwimConfig(1_000, 300, 3, 5_000, 6, 4, 300_000);
+        return new SwimConfig(1_000, 300, 3, 5_000, 6, 4, 300_000, 10);
     }
 
     /**
@@ -71,7 +80,7 @@ public record SwimConfig(
      * the test that covers reaping shortens it explicitly.
      */
     public static SwimConfig forTesting() {
-        return new SwimConfig(1_000, 200, 2, 3_000, 8, 5, 600_000);
+        return new SwimConfig(1_000, 200, 2, 3_000, 8, 5, 600_000, 10);
     }
 
     public Builder toBuilder() {
@@ -82,7 +91,8 @@ public record SwimConfig(
                 .suspicionTimeoutMillis(suspicionTimeoutMillis)
                 .maxGossipPerMessage(maxGossipPerMessage)
                 .gossipMultiplier(gossipMultiplier)
-                .deadReapMillis(deadReapMillis);
+                .deadReapMillis(deadReapMillis)
+                .deadProbeInterval(deadProbeInterval);
     }
 
     public static Builder builder() {
@@ -98,6 +108,7 @@ public record SwimConfig(
         private int maxGossipPerMessage = 6;
         private int gossipMultiplier = 4;
         private long deadReapMillis = 300_000;
+        private int deadProbeInterval = 10;
 
         public Builder protocolPeriodMillis(long value) {
             this.protocolPeriodMillis = value;
@@ -134,9 +145,15 @@ public record SwimConfig(
             return this;
         }
 
+        public Builder deadProbeInterval(int value) {
+            this.deadProbeInterval = value;
+            return this;
+        }
+
         public SwimConfig build() {
             return new SwimConfig(protocolPeriodMillis, pingTimeoutMillis, indirectProbeCount,
-                    suspicionTimeoutMillis, maxGossipPerMessage, gossipMultiplier, deadReapMillis);
+                    suspicionTimeoutMillis, maxGossipPerMessage, gossipMultiplier, deadReapMillis,
+                    deadProbeInterval);
         }
     }
 }

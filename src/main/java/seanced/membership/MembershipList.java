@@ -252,6 +252,26 @@ public final class MembershipList {
         return sample;
     }
 
+    /**
+     * A random member believed dead, if any.
+     *
+     * <p>Used to periodically re-check the graveyard. Without it, two nodes that have
+     * buried each other never exchange another message — dead members are out of the
+     * probe rotation — so a belief split outlives the network problem that caused it.
+     */
+    public Optional<NodeId> randomDeadMember(Random random) {
+        List<NodeId> dead = new ArrayList<>();
+        for (Member member : members.values()) {
+            if (member.isDead()) {
+                dead.add(member.id());
+            }
+        }
+        if (dead.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(dead.get(random.nextInt(dead.size())));
+    }
+
     /** Forgets a dead member entirely, so long-running clusters with churn don't grow without bound. */
     public void remove(NodeId id) {
         if (!id.equals(self)) {
